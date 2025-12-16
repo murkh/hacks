@@ -1,0 +1,127 @@
+import requests
+import boto3
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+import urllib.parse
+from io import BytesIO # Although we stream, we can fall back to BytesIO for small files or custom handling
+
+# --- Configuration ---
+# You should ideally set your AWS credentials as environment variables
+# (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION).
+# If you run this on an AWS EC2 instance, Lambda, or other service,
+# use IAM Roles for best practice.
+
+S3_BUCKET_NAME = "bucket-name"
+MAX_CONCURRENT_TRANSFERS = 32  # Adjust based on your network and CPU limits (e.g., 10 to 32 is common)
+
+# List of URLs to download
+FILE_URLS = [
+  # 300 files to upload
+]
+
+# Initialize S3 Client (it will automatically pick up credentials/config)
+s3_client = boto3.client('s3')
+
+def get_s3_key_from_url(url: str) -> str:
+    """
+    Extracts a filename to be used as the S3 Key from the URL.
+    You might need to adjust this logic based on your desired S3 path structure.
+    """
+    parsed_url = urllib.parse.urlparse(url)
+    path = parsed_url.path
+    
+    # Remove leading slash and URL-encode the path segments if necessary
+    # Here, we simply use the final path component (filename)
+    # E.g., for 'http://example.com/data/file2.zip' -> 'file2.zip'
+    return path.split('/')[-1]
+
+def download_and_upload_file(file_url: str, bucket_name: str) -> dict:
+    """
+    Downloads a file from a URL and streams it directly to S3 using upload_fileobj.
+    This avoids writing to disk.
+    """
+    s3_key = get_s3_key_from_url(file_url)
+    
+    # Using 'stream=True' is crucial to prevent reading the entire file into memory
+    # before starting the upload.
+    try:
+        print(f"Starting transfer for: {s3_key}")
+        
+        # 1. Download/Stream the file content
+        response = requests.get(file_url, stream=True)
+        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+
+        # The raw response stream is a file-like object, which is exactly what
+        # upload_fileobj expects for efficient streaming.
+        file_stream = response.raw
+
+        # 2. Upload the stream directly to S3
+        s3_client.upload_fileobj(
+            Fileobj=file_stream,
+            Bucket=bucket_name,
+            Key=s3_key,
+            # Optional: Add ExtraArgs to set content type, access control, etc.
+            # ExtraArgs={'ContentType': response.headers.get('Content-Type', 'binary/octet-stream')}
+        )
+
+        return {
+            "status": "success", 
+            "url": file_url, 
+            "s3_key": s3_key,
+            "message": "File uploaded successfully."
+        }
+        
+    except requests.exceptions.RequestException as e:
+        return {
+            "status": "failure", 
+            "url": file_url, 
+            "s3_key": s3_key, 
+            "message": f"Download error: {e}"
+        }
+    except Exception as e:
+        return {
+            "status": "failure", 
+            "url": file_url, 
+            "s3_key": s3_key, 
+            "message": f"S3 upload error: {e}"
+        }
+
+def process_all_files(urls: list, bucket: str, max_workers: int):
+    """
+    Uses a ThreadPoolExecutor for concurrent processing of all file transfers.
+    """
+    results = []
+    
+    # Using ThreadPoolExecutor is best for I/O-bound tasks like network transfers.
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks to the pool
+        future_to_url = {
+            executor.submit(download_and_upload_file, url, bucket): url for url in urls
+        }
+
+        # Retrieve results as they complete
+        for future in as_completed(future_to_url):
+            result = future.result()
+            print(f"Result for {result['s3_key']}: {result['status']} - {result['message']}")
+            results.append(result)
+            
+    return results
+
+if __name__ == "__main__":
+    print(f"Starting batch transfer of {len(FILE_URLS)} files to s3://{S3_BUCKET_NAME} with {MAX_CONCURRENT_TRANSFERS} workers.")
+    
+    all_results = process_all_files(FILE_URLS, S3_BUCKET_NAME, MAX_CONCURRENT_TRANSFERS)
+    
+    successful_count = sum(1 for r in all_results if r['status'] == 'success')
+    failed_count = len(all_results) - successful_count
+    
+    print("\n--- Summary ---")
+    print(f"Total files attempted: {len(all_results)}")
+    print(f"Successful transfers: {successful_count}")
+    print(f"Failed transfers: {failed_count}")
+    
+    if failed_count > 0:
+        print("\nFailed URLs:")
+        for r in all_results:
+            if r['status'] == 'failure':
+                print(f" - {r['url']}: {r['message']}")
